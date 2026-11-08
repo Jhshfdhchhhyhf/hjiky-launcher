@@ -1,6 +1,6 @@
 import os, sys, json, zipfile, subprocess, shutil, tempfile, re, threading, shlex, struct, uuid
 import urllib.request, urllib.error, urllib.parse, hashlib, time, datetime
-import http.server, webbrowser, secrets, base64, hmac
+import http.server, webbrowser, secrets, base64, hmac, math
 
 # ---------- PyInstaller-совместимость ----------
 if getattr(sys, "frozen", False):
@@ -116,7 +116,7 @@ def register_launcher_profile(version_id, display_name=None):
             pass
 
 # Microsoft OAuth public application Client ID (default for new installations).
-DEFAULT_MS_CLIENT_ID = "d578e9db-c08f-4044-a021-f0ac27222a9f"
+DEFAULT_MS_CLIENT_ID = ""
 
 DEFAULT_CFG = {"nickname": "Player", "gdrive_link": "", "memory_mb": 2048,
                "java": "Авто", "dark_theme": False, "errors_in_window": False,
@@ -1440,7 +1440,19 @@ def _post_json(url, payload, form=False):
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as ex:
-        detail = ex.read().decode("utf-8", "replace")[:1000]
+        detail = ex.read().decode("utf-8", "replace")[:2000]
+        # Microsoft device-code flow requires the app registration to allow public clients.
+        if ex.code == 400 and ("AADSTS70002" in detail or
+                               "client application must be marked as 'mobile'" in detail.lower()):
+            raise RuntimeError(
+                "Microsoft отклонил вход по коду (AADSTS70002). Это настройка приложения, "
+                "а не ошибка аккаунта Minecraft. Открой Microsoft Entra admin center → "
+                "App registrations → выбери приложение с этим Client ID → Authentication → "
+                "Advanced settings → включи 'Allow public client flows' (Yes) и сохрани. "
+                "Затем повтори вход по коду. Если у тебя нет доступа к регистрации этого "
+                "приложения, используй вход через браузер или укажи Client ID приложения, "
+                "в котором разрешены public client flows.\n\nПодробности: " + detail
+            ) from ex
         raise RuntimeError(f"Ошибка сервиса авторизации HTTP {ex.code}: {detail}") from ex
 
 
@@ -2052,6 +2064,59 @@ def log(msg, level="INFO"):
     log_win, log_text = _make_text_window("Журнал", "560x320", (log_win, log_text))
     append_text(log_text, f"[{level}] {msg}")
 
+
+def log_device_auth_instruction(message):
+    """Show the device-login URL as a link and the one-time code as copyable text."""
+    global log_win, log_text
+    log_win, log_text = _make_text_window("Журнал", "560x320", (log_win, log_text))
+    if log_text is None:
+        return
+    match = re.search(r"(https?://\S+)\s+и введи код\s+([A-Z0-9-]+)", message, re.I)
+    if not match:
+        append_text(log_text, f"[INFO] {message}")
+        return
+    url, code = match.group(1).rstrip(".,)"), match.group(2)
+    try:
+        log_text.configure(state="normal")
+        log_text.insert("end", "[INFO] Открой ")
+        start = log_text.index("end-1c")
+        log_text.insert("end", url)
+        end = log_text.index("end-1c")
+        log_text.tag_add("device_login_url", start, end)
+        log_text.insert("end", " и введи код ")
+        code_start = log_text.index("end-1c")
+        log_text.insert("end", code)
+        code_end = log_text.index("end-1c")
+        log_text.tag_add("device_login_code", code_start, code_end)
+        log_text.insert("end", "\n")
+        log_text.tag_configure("device_login_url", foreground="#1683e8", underline=True)
+        log_text.tag_configure("device_login_code", foreground="#16803c", underline=True)
+        log_text.tag_bind("device_login_url", "<Button-1>",
+                          lambda _event, target=url: webbrowser.open(target))
+        log_text.tag_bind("device_login_url", "<Enter>",
+                          lambda _event: log_text.configure(cursor="hand2"))
+        log_text.tag_bind("device_login_url", "<Leave>",
+                          lambda _event: log_text.configure(cursor="xterm"))
+        def copy_code(_event, value=code):
+            root.clipboard_clear()
+            root.clipboard_append(value)
+            root.update_idletasks()
+            status.config(text="Код Microsoft скопирован в буфер обмена")
+            return "break"
+        log_text.tag_bind("device_login_code", "<Button-1>", copy_code)
+        log_text.tag_bind("device_login_code", "<Enter>",
+                          lambda _event: log_text.configure(cursor="hand2"))
+        log_text.tag_bind("device_login_code", "<Leave>",
+                          lambda _event: log_text.configure(cursor="xterm"))
+        log_text.see("end")
+        log_text.configure(state="disabled")
+    except Exception as ex:
+        try:
+            log_text.configure(state="disabled")
+        except Exception:
+            pass
+        debug_log(f"Не удалось оформить ссылку/код входа: {ex}")
+
 def debug_log(msg):
     # Tk widgets must only be touched from the GUI thread.
     if threading.current_thread() is not threading.main_thread():
@@ -2603,6 +2668,36 @@ def microsoft_login():
     threading.Thread(target=worker, daemon=True).start()
 
 
+
+
+def microsoft_device_login_ui():
+    """Add a licensed Microsoft account using the device-code flow."""
+    client_id = cfg.get("ms_client_id", "").strip()
+    if not client_id:
+        error("Укажи Microsoft Client ID в настройках. Это публичный ID приложения, не пароль.")
+        return
+    status.config(text="Подготавливаю вход по коду Microsoft…")
+
+    def report(message):
+        def show():
+            status.config(text=message)
+            log_device_auth_instruction(message)
+        root.after(0, show)
+
+    def worker():
+        try:
+            account = microsoft_device_login(client_id, on_status=report)
+            saved = save_account_refresh_token(account) if account.get("refresh_token") else False
+            root.after(0, lambda: _set_active_microsoft_account(
+                account, saved=saved,
+                log_message=f"Вход по коду Microsoft выполнен: {account['username']}; лицензия Java Edition подтверждена."))
+        except Exception as ex:
+            msg = str(ex)
+            root.after(0, lambda: (error("Ошибка входа по коду Microsoft: " + msg),
+                                   status.config(text="Вход не выполнен")))
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def switch_microsoft_account_async(uuid):
     """Activate a previously remembered Microsoft account by refreshing its token."""
     meta = next((a for a in get_saved_microsoft_accounts() if a.get("uuid") == uuid), None)
@@ -2635,7 +2730,7 @@ def open_microsoft_accounts():
     win = tk.Toplevel(root)
     S(win, role="bg")
     win.title("Microsoft-аккаунты")
-    win.geometry("430x330")
+    win.geometry("520x370")
     win.transient(root)
     win.grab_set()
     outer = tk.Frame(win); S(outer, role="bg"); outer.pack(fill="both", expand=True, padx=12, pady=12)
@@ -2682,7 +2777,8 @@ def open_microsoft_accounts():
 
     row = tk.Frame(outer); S(row, role="bg"); row.pack(fill="x")
     S(tk.Button(row, text="Использовать", command=use_selected), role="accent", fg=pal["fg"]).pack(side="left", padx=2)
-    S(tk.Button(row, text="Добавить аккаунт", command=microsoft_login), role="accent", fg=pal["fg"]).pack(side="left", padx=2)
+    S(tk.Button(row, text="Добавить через браузер", command=microsoft_login), role="accent", fg=pal["fg"]).pack(side="left", padx=2)
+    S(tk.Button(row, text="Войти по коду", command=microsoft_device_login_ui), role="accent", fg=pal["fg"]).pack(side="left", padx=2)
     S(tk.Button(row, text="Удалить", command=remove_selected), role="accent", fg=pal["fg"]).pack(side="left", padx=2)
     S(tk.Button(outer, text="Закрыть", command=win.destroy), role="accent", fg=pal["fg"]).pack(anchor="e", pady=(8, 0))
 
@@ -2763,11 +2859,12 @@ def open_settings():
     e_nick.insert(0, cfg["nickname"])
     e_nick.grid(row=0, column=1, sticky="we", pady=3)
 
-    lbl(1, "Microsoft Client ID:")
-    e_ms_client = S(tk.Entry(sf, width=45), role="accent", fg=pal["fg"], insertbackground=pal["fg"])
+    lbl(1, "Microsoft Client ID (скрыт звёздочками):")
+    # Client ID remains editable/pastable, but is masked on screen like a credential.
+    e_ms_client = S(tk.Entry(sf, width=45, show="*"), role="accent", fg=pal["fg"], insertbackground=pal["fg"])
     e_ms_client.insert(0, cfg.get("ms_client_id", ""))
     e_ms_client.grid(row=1, column=1, sticky="we", pady=3)
-    S(tk.Label(sf, text="Нужен Client ID приложения для личных Microsoft-аккаунтов. В Authentication добавь Mobile and desktop applications → http://localhost и включи Allow public client flows. Вход откроется в браузере. Для запоминания аккаунтов установи: pip install keyring.",
+    S(tk.Label(sf, text="Нужен Client ID приложения для личных Microsoft-аккаунтов. Для входа по коду открой App registrations → Authentication → Advanced settings и включи Allow public client flows = Yes. Для браузерного входа настрой Mobile and desktop applications → http://localhost. Для запоминания аккаунтов установи: pip install keyring.",
                wraplength=420), role="bg", fg=pal["notinstalled"]).grid(
                    row=2, column=0, columnspan=2, sticky="w")
 
@@ -2913,32 +3010,153 @@ def open_settings():
     S(tk.Label(skin_frame, text="Скины аккаунта (нужен вход Microsoft):"), role="bg", fg=pal["fg"]).pack(anchor="w")
     skin_list = tk.Listbox(skin_frame, height=3, exportselection=False)
     S(skin_list, role="accent", fg=pal["fg"]).pack(fill="x", pady=2)
-    skin_preview_photo = {"image": None}
-    def show_skin_preview(source, title="Предпросмотр скина"):
-        """Показывает текстуру Minecraft 64x64; Pillow не обязателен."""
+    skin_preview_photo = {"image": None, "window": None, "canvas": None,
+                          "texture": None, "angle": 0.55, "tilt": -0.12,
+                          "zoom": 7.0, "drag": None}
+
+    def show_skin_preview(source, title="3D-предпросмотр скина"):
+        """Строит интерактивную 3D-модель Minecraft из PNG-текстуры."""
         try:
+            import base64
             if isinstance(source, bytes):
-                import base64
                 photo = tk.PhotoImage(data=base64.b64encode(source))
-            elif source.startswith(("https://", "http://")):
-                data = _http_get(source, timeout=25)
-                import base64
-                photo = tk.PhotoImage(data=base64.b64encode(data))
+            elif isinstance(source, str) and source.startswith(("https://", "http://")):
+                photo = tk.PhotoImage(data=base64.b64encode(_http_get(source, timeout=25)))
             else:
                 photo = tk.PhotoImage(file=source)
-            # Увеличенная текстура помогает рассмотреть детали и не требует Pillow.
-            if photo.width() <= 128 and photo.height() <= 128:
-                photo = photo.zoom(4, 4)
+            if photo.width() not in (64, 128) or photo.height() not in (32, 64, 128):
+                raise ValueError("Ожидается PNG-текстура Minecraft 64×64 или совместимого размера.")
+            # 128x128 — HD skin: координаты UV масштабируются вдвое.
+            scale = 2 if photo.width() >= 128 else 1
+            tw, th = photo.width(), photo.height()
+            if skin_preview_photo["window"] is not None:
+                try:
+                    if skin_preview_photo["window"].winfo_exists():
+                        skin_preview_photo["window"].destroy()
+                except Exception:
+                    pass
+
             preview = tk.Toplevel(win)
             preview.title(title)
+            preview.geometry("560x620")
             S(preview, role="bg")
-            holder = tk.Frame(preview); S(holder, role="bg"); holder.pack(padx=12, pady=12)
-            image_label = tk.Label(holder, image=photo, bd=0)
-            image_label.pack()
-            skin_preview_photo["image"] = photo  # удерживаем ссылку для Tk
-            S(tk.Label(holder, text="Текстура скина (UV-развёртка 64×64)"), role="bg", fg=pal["fg"]).pack(pady=(6, 0))
+            canvas = tk.Canvas(preview, width=520, height=520,
+                               highlightthickness=0, bg=pal["bg"])
+            canvas.pack(fill="both", expand=True, padx=12, pady=(12, 4))
+            hint = tk.Label(preview, text="Зажми левую кнопку мыши и двигай для вращения • Колесо — масштаб",
+                            fg=pal["fg"], bg=pal["bg"])
+            hint.pack(pady=(2, 10))
+            state = {"angle": 0.55, "tilt": -0.12, "zoom": 7.0,
+                     "drag": None, "photo": photo, "canvas": canvas}
+            skin_preview_photo.update({"window": preview, "canvas": canvas,
+                                       "texture": photo})
+
+            def pixel(u, v):
+                u = max(0, min(tw - 1, int(u)))
+                v = max(0, min(th - 1, int(v)))
+                try:
+                    c = photo.get(u, v)
+                    if isinstance(c, str):
+                        c = tuple(int(x) for x in c.split())
+                    return tuple(max(0, min(255, int(x))) for x in c[:3])
+                except Exception:
+                    return (150, 150, 150)
+
+            def uv_color(rect, fx, fy):
+                x, y, w, h = rect
+                return pixel((x + min(.999, max(0, fx)) * w) * scale,
+                             (y + min(.999, max(0, fy)) * h) * scale)
+
+            def shade(c, factor):
+                return tuple(max(0, min(255, int(v * factor))) for v in c)
+
+            # Minecraft classic UV front panels (base layer); outer overlays are
+            # represented by the same textured geometry for a clean preview.
+            parts = [
+                # name, box(x0,x1,y0,y1,z0,z1), front UV(x,y,w,h), grid
+                ("head", (-4,4, 24,32, -4,4), (8,8,8,8), (8,8)),
+                ("body", (-4,4, 12,24, -2,2), (20,20,8,12), (8,12)),
+                ("right_arm", (-8,-4, 12,24, -2,2), (44,20,4,12), (4,12)),
+                ("left_arm", (4,8, 12,24, -2,2), (44,20,4,12), (4,12)),
+                ("right_leg", (-4,0, 0,12, -2,2), (4,20,4,12), (4,12)),
+                ("left_leg", (0,4, 0,12, -2,2), (4,20,4,12), (4,12)),
+            ]
+
+            def project(p):
+                x, y, z = p
+                ca, sa = math.cos(state["angle"]), math.sin(state["angle"])
+                x, z = x*ca - z*sa, x*sa + z*ca
+                ct, st = math.cos(state["tilt"]), math.sin(state["tilt"])
+                y, z = y*ct - z*st, y*st + z*ct
+                return (260 + x*state["zoom"], 285 - y*state["zoom"], z)
+
+            def draw():
+                canvas.delete("all")
+                canvas.configure(bg=pal["bg"])
+                faces = []
+                for name, (x0,x1,y0,y1,z0,z1), uv, grid in parts:
+                    # six faces; front (z=-) receives the actual UV texture grid.
+                    corners = {
+                        "front": [(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)],
+                        "back": [(x1,y0,z1),(x0,y0,z1),(x0,y1,z1),(x1,y1,z1)],
+                        "left": [(x0,y0,z1),(x0,y0,z0),(x0,y1,z0),(x0,y1,z1)],
+                        "right": [(x1,y0,z0),(x1,y0,z1),(x1,y1,z1),(x1,y1,z0)],
+                        "top": [(x0,y1,z0),(x1,y1,z0),(x1,y1,z1),(x0,y1,z1)],
+                        "bottom": [(x0,y0,z1),(x1,y0,z1),(x1,y0,z0),(x0,y0,z0)]
+                    }
+                    for side, pts in corners.items():
+                        pp = [project(p) for p in pts]
+                        depth = sum(p[2] for p in pp) / 4
+                        if side == "front":
+                            gx, gy = grid
+                            for iy in range(gy):
+                                for ix in range(gx):
+                                    fx0, fx1 = ix/gx, (ix+1)/gx
+                                    fy0, fy1 = iy/gy, (iy+1)/gy
+                                    p0 = (x0+(x1-x0)*fx0, y0+(y1-y0)*fy0, z0)
+                                    p1 = (x0+(x1-x0)*fx1, y0+(y1-y0)*fy0, z0)
+                                    p2 = (x0+(x1-x0)*fx1, y0+(y1-y0)*fy1, z0)
+                                    p3 = (x0+(x1-x0)*fx0, y0+(y1-y0)*fy1, z0)
+                                    col = uv_color(uv, (ix+.5)/gx, (iy+.5)/gy)
+                                    faces.append((sum(project(p)[2] for p in (p0,p1,p2,p3))/4,
+                                                  [project(p) for p in (p0,p1,p2,p3)], col, True))
+                        else:
+                            base = uv_color(uv, .5, .5)
+                            factor = {"back":.62,"left":.72,"right":.82,"top":1.12,"bottom":.48}[side]
+                            faces.append((depth, pp, shade(base, factor), False))
+                # painter's algorithm: far surfaces first
+                for _, pts, col, textured in sorted(faces, key=lambda f:f[0]):
+                    flat = [v for p in pts for v in p[:2]]
+                    color = "#%02x%02x%02x" % col
+                    canvas.create_polygon(*flat, fill=color,
+                                           outline=("#242424" if textured else "#333333"),
+                                           width=1 if textured else 2)
+
+            def press(event):
+                state["drag"] = (event.x, event.y)
+            def drag(event):
+                if state["drag"] is None:
+                    return
+                ox, oy = state["drag"]
+                state["angle"] += (event.x - ox) * .012
+                state["tilt"] = max(-1.1, min(1.1, state["tilt"] + (event.y - oy) * .009))
+                state["drag"] = (event.x, event.y)
+                draw()
+            def release(_event):
+                state["drag"] = None
+            def wheel(event):
+                delta = 1.12 if getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4 else .89
+                state["zoom"] = max(3.5, min(13, state["zoom"] * delta))
+                draw()
+            canvas.bind("<ButtonPress-1>", press)
+            canvas.bind("<B1-Motion>", drag)
+            canvas.bind("<ButtonRelease-1>", release)
+            canvas.bind("<MouseWheel>", wheel)
+            canvas.bind("<Button-4>", wheel)
+            canvas.bind("<Button-5>", wheel)
+            draw()
         except Exception as ex:
-            error("Не удалось показать скин: " + str(ex))
+            error("Не удалось построить 3D-модель скина: " + str(ex))
 
     def reload_skins():
         skin_list.delete(0, "end")
@@ -3002,6 +3220,7 @@ def open_settings():
             except Exception as ex:
                 msg = str(ex); root.after(0, lambda: error("Не удалось сменить скин: " + msg))
         threading.Thread(target=worker, daemon=True).start()
+    skin_list.bind("<<ListboxSelect>>", lambda _event: preview_selected_skin())
     skin_variant = tk.StringVar(value="classic")
     S(tk.Radiobutton(skin_frame, text="Classic", variable=skin_variant, value="classic"), role="bg", fg=pal["fg"]).pack(side="left")
     S(tk.Radiobutton(skin_frame, text="Slim", variable=skin_variant, value="slim"), role="bg", fg=pal["fg"]).pack(side="left")
@@ -3116,6 +3335,7 @@ mk_btn("🔄 Обновить каталоги (Mojang + Drive)",
        lambda: (rebuild_list(), refresh_vanilla_async(silent=True), refresh_remote_async(silent=True)))
 mk_btn("⬇ Установить выбранное (Mojang / Fabric / Forge / NeoForge / Drive)", install_selected_or_vanilla)
 mk_btn("🔐 Войти через Microsoft в браузере", microsoft_login)
+mk_btn("🔑 Войти через Microsoft по коду", microsoft_device_login_ui)
 mk_btn("👥 Управление Microsoft-аккаунтами", open_microsoft_accounts)
 mk_btn("↩ Выйти из текущего Microsoft-аккаунта", microsoft_logout)
 mk_btn("📋 Журнал (ошибки и сообщения)", lambda: log("Открыт журнал"))
